@@ -102,7 +102,7 @@ class TwitchChatReader:
         while self.running:
             current_time = time.time()
             if current_time - self.last_save_time >= 30 and self.last_message:
-                filename = f"twitch_chat_{datetime.now().strftime('%Y%m%d')}.txt"
+                filename = "twitch_chat.txt"
                 
                 try:
                     with open(filename, 'a', encoding='utf-8') as f:
