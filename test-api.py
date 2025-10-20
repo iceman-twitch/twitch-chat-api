@@ -1,160 +1,173 @@
-import requests
+import socket
+import threading
 import time
 import json
 from datetime import datetime
 
-class TwitchChatBot:
-    def __init__(self, client_id, client_secret):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.access_token = None
+class TwitchChatReader:
+    def __init__(self, channel, nickname, token):
+        self.channel = channel.lower()
+        self.nickname = nickname.lower()
+        self.token = token
+        self.socket = None
         self.last_message = None
+        self.running = False
+        self.last_save_time = time.time()
         
-    def get_app_access_token(self):
-        """Get app access token using client credentials"""
-        url = "https://id.twitch.tv/oauth2/token"
-        
-        params = {
-            'client_id': self.client_id,
-            'client_secret': self.client_secret,
-            'grant_type': 'client_credentials'
-        }
-        
+    def connect(self):
+        """Connect to Twitch IRC server"""
         try:
-            response = requests.post(url, params=params)
-            response.raise_for_status()
+            self.socket = socket.socket()
+            self.socket.settimeout(10.0)
+            self.socket.connect(('irc.chat.twitch.tv', 6667))
             
-            data = response.json()
-            self.access_token = data['access_token']
-            print("✅ Successfully obtained access token")
+            # Authenticate
+            self.socket.send(f"PASS {self.token}\r\n".encode('utf-8'))
+            self.socket.send(f"NICK {self.nickname}\r\n".encode('utf-8'))
+            self.socket.send(f"JOIN #{self.channel}\r\n".encode('utf-8'))
+            
+            print(f"✅ Connected to #{self.channel}'s chat")
             return True
             
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Error getting access token: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                print(f"Response: {e.response.text}")
+        except Exception as e:
+            print(f"❌ Connection failed: {e}")
             return False
-    
-    def get_channel_info(self, username):
-        """Get channel ID from username"""
-        headers = {
-            'Client-ID': self.client_id,
-            'Authorization': f'Bearer {self.access_token}'
-        }
         
-        url = f"https://api.twitch.tv/helix/users?login={username}"
+    def listen(self):
+        """Listen for messages"""
+        buffer = ""
         
-        try:
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            
-            data = response.json()
-            if data['data']:
-                channel_id = data['data'][0]['id']
-                print(f"✅ Found channel ID: {channel_id} for {username}")
-                return channel_id
-            else:
-                print(f"❌ Channel {username} not found")
-                return None
+        while self.running:
+            try:
+                data = self.socket.recv(1024).decode('utf-8', errors='ignore')
+                if not data:
+                    print("⚠️  Connection lost, reconnecting...")
+                    self.reconnect()
+                    continue
+                    
+                buffer += data
+                lines = buffer.split("\r\n")
+                buffer = lines.pop()
                 
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Error getting channel info: {e}")
-            return None
-    
-    def get_chat_messages(self, channel_id, limit=10):
-        """Get recent chat messages"""
-        headers = {
-            'Client-ID': self.client_id,
-            'Authorization': f'Bearer {self.access_token}'
-        }
-        
-        url = f"https://api.twitch.tv/helix/chat/messages?broadcaster_id={channel_id}"
-        
-        try:
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            
-            data = response.json()
-            return data.get('data', [])
-            
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Error getting chat messages: {e}")
-            return []
-    
-    def monitor_chat(self, channel_username):
-        """Monitor chat and save last message every 30 seconds"""
-        print(f"🚀 Starting chat monitor for: {channel_username}")
-        
-        # Get access token
-        if not self.get_app_access_token():
-            return
-        
-        # Get channel ID
-        channel_id = self.get_channel_info(channel_username)
-        if not channel_id:
-            return
-        
-        print("📝 Monitoring chat... (Ctrl+C to stop)")
-        
-        try:
-            while True:
-                messages = self.get_chat_messages(channel_id)
+                for line in lines:
+                    if line:
+                        self.handle_line(line)
+                        
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"❌ Listen error: {e}")
+                if self.running:
+                    self.reconnect()
                 
-                if messages:
-                    latest_message = messages[0]  # Most recent message
+    def handle_line(self, line):
+        """Handle incoming IRC messages"""
+        # Respond to PING
+        if line.startswith('PING'):
+            self.socket.send("PONG :tmi.twitch.tv\r\n".encode('utf-8'))
+            return
+            
+        # Handle PRIVMSG (chat messages)
+        if 'PRIVMSG' in line:
+            try:
+                # Parse the message
+                parts = line.split(':', 2)
+                if len(parts) >= 3:
+                    username = parts[1].split('!')[0]
+                    message = parts[2].strip()
                     
                     self.last_message = {
                         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'username': latest_message.get('commenter', {}).get('display_name', 'Unknown'),
-                        'message': latest_message.get('message', {}).get('body', '')
+                        'username': username,
+                        'message': message
                     }
                     
-                    # Save to file
-                    self.save_message()
-                    print(f"💾 Saved: {self.last_message['username']}: {self.last_message['message']}")
-                else:
-                    print("⏳ No new messages")
+                    print(f"💬 [{self.last_message['timestamp']}] {username}: {message}")
+                    
+            except Exception as e:
+                print(f"Error parsing message: {e}")
                 
-                # Wait 30 seconds
-                print("⏰ Waiting 30 seconds...")
-                time.sleep(30)
+    def reconnect(self):
+        """Reconnect to Twitch IRC"""
+        time.sleep(5)
+        try:
+            if self.socket:
+                self.socket.close()
+            self.connect()
+        except Exception as e:
+            print(f"Reconnection failed: {e}")
+            
+    def save_last_message(self):
+        """Save the last message every 30 seconds"""
+        while self.running:
+            current_time = time.time()
+            if current_time - self.last_save_time >= 30 and self.last_message:
+                filename = f"twitch_chat_{datetime.now().strftime('%Y%m%d')}.txt"
                 
+                try:
+                    with open(filename, 'a', encoding='utf-8') as f:
+                        f.write(f"{self.last_message['timestamp']} - {self.last_message['username']}: {self.last_message['message']}\n")
+                    
+                    print(f"💾 Saved message to {filename}")
+                    self.last_save_time = current_time
+                    self.last_message = None  # Reset for next interval
+                    
+                except Exception as e:
+                    print(f"Error saving message: {e}")
+                    
+            time.sleep(1)
+            
+    def start(self):
+        """Start the chat reader"""
+        if not self.connect():
+            return
+            
+        self.running = True
+        
+        # Start listening thread
+        listen_thread = threading.Thread(target=self.listen)
+        listen_thread.daemon = True
+        listen_thread.start()
+        
+        # Start saving thread
+        save_thread = threading.Thread(target=self.save_last_message)
+        save_thread.daemon = True
+        save_thread.start()
+        
+        print("🚀 Chat reader started! Press Ctrl+C to stop.")
+        
+        try:
+            while self.running:
+                time.sleep(1)
         except KeyboardInterrupt:
-            print("\n🛑 Stopped by user")
-    
-    def save_message(self):
-        """Save message to file"""
-        if self.last_message:
-            filename = "twitch_chat.txt"
-            with open(filename, 'a', encoding='utf-8') as f:
-                f.write(f"{self.last_message['timestamp']} - {self.last_message['username']}: {self.last_message['message']}\n")
+            print("\n🛑 Stopping...")
+            self.running = False
+            if self.socket:
+                self.socket.close()
 
 def load_credentials():
-    """Load credentials from credentials.json file"""
+    """Load Twitch credentials from credentials.json file"""
     try:
         with open('credentials.json', 'r') as f:
-            credentials = json.load(f)
-            return (
-                credentials['client_id'],
-                credentials['client_secret'],
-                credentials['channel_username']
-            )
+            creds = json.load(f)
+            return creds['channel'], creds['nickname'], creds['token']
     except FileNotFoundError:
         print("❌ credentials.json file not found")
-        return None
+        return None, None, None
     except json.JSONDecodeError:
-        print("❌ Error reading credentials.json file")
-        return None
+        print("❌ Error parsing credentials.json file")
+        return None, None, None
     except KeyError as e:
         print(f"❌ Missing required field in credentials.json: {e}")
-        return None
+        return None, None, None
 
-# Replace the hardcoded credentials with the loading function
+# Update the main section
 if __name__ == "__main__":
-    credentials = load_credentials()
-    if credentials:
-        CLIENT_ID, CLIENT_SECRET, CHANNEL_USERNAME = credentials
-        bot = TwitchChatBot(CLIENT_ID, CLIENT_SECRET)
-        bot.monitor_chat(CHANNEL_USERNAME)
-    else:
-        print("Failed to load credentials. Please check your credentials.json file.")
+    CHANNEL, NICKNAME, TOKEN = load_credentials()
+    
+    if not all([CHANNEL, NICKNAME, TOKEN]):
+        print("❌ Failed to load credentials. Please check your credentials.json file.")
+        exit(1)
+        
+    reader = TwitchChatReader(CHANNEL, NICKNAME, TOKEN)
+    reader.start()
